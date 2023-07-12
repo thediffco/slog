@@ -47,12 +47,17 @@ class Company(Agent):
         self.budget_previous_step = self.funding
         self.revenue = 0
         self.rides_this_round = 0
+        self.spending = 0
+        self.pnl = 0
 
     def allocate_budget(self):
         # The company allocates half of its remaining budget, unless there are not enough inactive passengers/drivers.
         # The allocation is done in proportion to the failure rates of drivers and passengers.
         if self.funding < min(self.model.passenger_cac, self.model.driver_cac):
             self.model.running = False
+        if self.funding < 0:
+            self.model.running = False
+        total_budget = self.funding / 2
         
         inactive_passengers = [p for p in self.model.schedule.agents if isinstance(p, Passenger) and not p.app_on]
         inactive_drivers = [d for d in self.model.schedule.agents if isinstance(d, Driver) and not d.app_on]
@@ -61,28 +66,34 @@ class Company(Agent):
         failure_rate_driver = len([d for d in self.model.schedule.agents if isinstance(d, Driver) and not d.had_passenger]) / self.model.num_drivers
         
         total_failure_rate = failure_rate_passenger + failure_rate_driver
-
-        total_budget = self.funding / 2
-
-        passenger_share = failure_rate_passenger / total_failure_rate
-        driver_share = 1 - passenger_share
-
-        passenger_budget = min(total_budget * passenger_share,
-                               len(inactive_passengers) * self.model.passenger_cac)
-        driver_budget = min(total_budget * driver_share,
-                            len(inactive_drivers) * self.model.driver_cac)
+        if total_failure_rate == 0:
+            passenger_budget = 0
+            driver_budget = 0
+        else:
+            passenger_share = failure_rate_passenger / total_failure_rate
+            driver_share = 1 - passenger_share
+            passenger_budget = min(total_budget * passenger_share,
+                                   len(inactive_passengers) * self.model.passenger_cac)
+            driver_budget = min(total_budget * driver_share,
+                                len(inactive_drivers) * self.model.driver_cac)
         
         num_passengers_to_market = min(len(inactive_passengers), passenger_budget // self.model.passenger_cac)
         num_drivers_to_market = min(len(inactive_drivers), driver_budget // self.model.driver_cac)
 
-        self.funding -= passenger_budget + driver_budget  # subtract the allocated marketing spend from the budget
-
         # if company's remaining budget is less than the lower of passenger_cac and driver_cac, end the simulation
+
+        if passenger_budget +  driver_budget < 0:
+            print("Negative budget! Abort.")
+            self.model.running = False
+
+        if len(self.cash_history) > 20:
+            if self.cash_history[-1] > self.cash_history[-20]:
+                print("Company achieved sustainable model, exiting now!")
+                self.model.running = False
             
         return passenger_budget, driver_budget, num_passengers_to_market, num_drivers_to_market
 
     def step(self):
-        self.rides_this_round = 0
         passenger_budget, driver_budget, num_passengers_to_market, num_drivers_to_market = self.allocate_budget()
     
         # Convert these numbers to integers
@@ -104,8 +115,13 @@ class Company(Agent):
         # Update revenue and cash history
         self.revenue = self.model.profit_per_ride * self.rides_this_round
         self.funding += self.revenue
+        self.funding -= passenger_budget + driver_budget
         self.revenue_history.append(self.revenue)
         self.cash_history.append(self.funding)
+        self.rides_this_round = 0
+        self.spending = passenger_budget + driver_budget
+        self.pnl = self.revenue - self.spending
+
         
 class RideshareModel(Model):
     def __init__(self, N_passengers,
@@ -148,15 +164,12 @@ class RideshareModel(Model):
     def check_for_driver(self, passenger):
         # Get list of drivers at passenger's location
         nearby_cells = []
-        for dx in range(-5, 6):
-            for dy in range(-5, 6):
-                # Skip the current cell itself
-                if dx == 0 and dy == 0:
-                    continue
-        # Check if the cell is within the grid boundaries
-            x, y = passenger.pos[0] + dx, passenger.pos[1] + dy
-            if 0 <= x < self.grid.width and 0 <= y < self.grid.height:
-                nearby_cells.append((x, y))
+        for dx in range(-10, 11):
+            for dy in range(-10, 11):
+                # Check if the cell is within the grid boundaries
+                x, y = passenger.pos[0] + dx, passenger.pos[1] + dy
+                if 0 <= x < self.grid.width and 0 <= y < self.grid.height:
+                    nearby_cells.append((x, y))
         nearby_agents = [self.grid.get_cell_list_contents([pos]) for pos in nearby_cells]
         nearby_agents = [agent for sublist in nearby_agents for agent in sublist]
         drivers = [agent for agent in nearby_agents if type(agent) is Driver and agent.app_on]
@@ -164,9 +177,9 @@ class RideshareModel(Model):
         # If there's a driver here, a ride happens
         if drivers:
             passenger.had_ride = True
-            drivers[0].had_passenger = True
-            drivers[0].app_on = True
-            drivers[0].had_passenger = True
+            driver = random.choice(drivers)
+            driver.had_passenger = True
+            driver.app_on = True
             passenger.app_on = True
             self.company.rides_this_round += 1
 
@@ -175,16 +188,52 @@ class RideshareModel(Model):
         passengers = [agent for agent in self.schedule.agents if isinstance(agent, Passenger)]
         company = self.company
 
-        company_spending = company.budget_previous_step - company.funding
+        company_spending = company.spending
         company_revenue = len([p for p in passengers if p.had_ride]) * self.profit_per_ride
+        company_cash = company.funding - company_spending
+        company_pnl = company_revenue - company_spending
         percent_drivers_on = len([d for d in drivers if d.app_on]) / self.num_drivers * 100
         percent_passengers_on = len([p for p in passengers if p.app_on]) / self.num_passengers * 100
         success_rate_drivers = len([d for d in drivers if d.had_passenger]) / self.num_drivers * 100
         success_rate_passengers = len([p for p in passengers if p.had_ride]) / self.num_passengers * 100
-        
-        print(f"Spend: {company_spending:.1f}, Rev: {company_revenue:.1f}, D-Pen: {percent_drivers_on:.1f}%, P-Pen: {percent_passengers_on:.1f}%, D-Succ: {success_rate_drivers:.1f}%, P-Succ: {success_rate_passengers:.1f}%")
+
+        headers = "| {:>4} | {:>5} | {:>5} | {:>5} | {:>5} | {:>7} | {:>7} | {:>7} | {:>7} |".format(
+            "Step", "Spend", "Rev", "Cash", "PnL", "D-Pen %", "P-Pen %", "D-Succ %", "P-Succ %")
+        row_data = "| {:>4} | {:>5.1f} | {:>5.1f} | {:>5.1f} | {:>5.1f} | {:>7.1f} | {:>7.1f} | {:>7.1f} | {:>7.1f} |".format(
+            self.schedule.steps, company_spending, company_revenue, company_cash, company_pnl, 
+            percent_drivers_on, percent_passengers_on, success_rate_drivers, success_rate_passengers)
+
+        if self.schedule.steps == 1:
+            print(headers)
+            print(row_data)
+    
         company.budget_previous_step = company.funding
 
+    def calculate_statistics(self):
+        drivers = [agent for agent in self.schedule.agents if isinstance(agent, Driver)]
+        passengers = [agent for agent in self.schedule.agents if isinstance(agent, Passenger)]
+        company = self.company
+
+        company_spending = company.spending
+        company_revenue = len([p for p in passengers if p.had_ride]) * self.profit_per_ride
+        company_cash = company.funding - company_spending
+        company_pnl = company_revenue - company_spending
+        percent_drivers_on = len([d for d in drivers if d.app_on]) / self.num_drivers * 100
+        percent_passengers_on = len([p for p in passengers if p.app_on]) / self.num_passengers * 100
+        success_rate_drivers = len([d for d in drivers if d.had_passenger]) / self.num_drivers * 100
+        success_rate_passengers = len([p for p in passengers if p.had_ride]) / self.num_passengers * 100
+
+        headers = "| Step | Spend | Rev | Cash | PnL | D-Pen % | P-Pen % | D-Succ % | P-Succ % |"
+        row_data = "| {} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} | {:.1f} |".format(
+            self.schedule.steps, company_spending, company_revenue, company_cash, company_pnl, 
+            percent_drivers_on, percent_passengers_on, success_rate_drivers, success_rate_passengers)
+
+        if self.schedule.steps == 1:
+            print(headers)
+        print(row_data)
+    
+        company.budget_previous_step = company.funding
+            
     def step(self):
         if not self.running:
             return
@@ -230,11 +279,14 @@ def distance(agent1, agent2):
 
 
 ## Current test run: 
-# run_model(100, 100, 10, 10, 2000, 2, 5, 10)
+# run_model(100, 20, 50, 50, 2000, 2, 5, 10)
+# For legibility: 
 
-## TODO
-
-# Company isn't spending correctly. See below.
-
-# Spend: 910.0, Rev: 90.0, D-Pen: 50.0%, P-Pen: 100.0%, D-Succ: 6.0%, P-Succ: 45.0%
-# Spend: 313.8, Rev: 90.0, D-Pen: 73.0%, P-Pen: 100.0%, D-Succ: 8.0%, P-Succ: 45.0%
+# run_model(N_passengers = 100,
+#           N_drivers = 20,
+#           width = 50 ,
+#           height = 50,
+#           co_funding = 200,
+#           profit_per_ride = 2,
+#           passenger_cac = 5,
+#           driver_cac = 10)
