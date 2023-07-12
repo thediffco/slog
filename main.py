@@ -279,14 +279,14 @@ def distance(agent1, agent2):
 
 
 ## Current test run: 
-# run_model(100, 20, 50, 50, 2000, 2, 5, 10)
+# run_model(100, 20, 50, 50, 175, 2, 5, 10)
 # For legibility: 
 
 # run_model(N_passengers = 100,
 #           N_drivers = 20,
 #           width = 50 ,
 #           height = 50,
-#           co_funding = 200,
+#           co_funding = 175
 #           profit_per_ride = 2,
 #           passenger_cac = 5,
 #           driver_cac = 10)
